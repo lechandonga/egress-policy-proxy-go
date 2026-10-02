@@ -1,0 +1,29 @@
+{
+  "rules": [
+    {
+      "id": "deny-danger-nets",
+      "action": "deny",
+      "cidrs": ["169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8"],
+      "priority": 100
+    },
+    {
+      "id": "block-admin-hosts",
+      "action": "deny",
+      "domains": ["*.internal.example.com", "admin.example.com"],
+      "ports": [443, 80]
+    },
+    {
+      "id": "allow-https-saas",
+      "action": "allow",
+      "domains": ["api.saas.example", "*.cdn.example.com"],
+      "ports": [443]
+    },
+    {
+      "id": "allow-package-mirror",
+      "action": "allow",
+      "domains": ["mirror.example.com"],
+      "cidrs": ["203.0.113.0/24"],
+      "ports": ["8000-9000"]
+    }
+  ]
+}

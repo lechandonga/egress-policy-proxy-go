@@ -1,0 +1,132 @@
+package stats
+
+import (
+	"sort"
+	"sync"
+	"sync/atomic"
+)
+
+// Outcome is the single bucket a request is counted in. Every proxied
+// request is counted exactly once, in exactly one bucket.
+type Outcome string
+
+const (
+	OutcomeAllowed           Outcome = "allowed"             // forwarded and the upstream exchange finished
+	OutcomeDeniedPolicy      Outcome = "denied_policy"       // policy verdict deny (incl. default deny)
+	OutcomeResolveFailed     Outcome = "resolve_failed"      // NXDOMAIN / resolver failure
+	OutcomeUpstreamDial      Outcome = "upstream_dial"       // connection refused / network unreachable
+	OutcomeUpstreamIOTimeout Outcome = "upstream_io_timeout" // deadline while talking to upstream
+	OutcomeClientError       Outcome = "client_error"        // malformed proxy request
+)
+
+// Counters is a lock-free, goroutine-safe set of request counters.
+type Counters struct {
+	total   atomic.Uint64
+	buckets [6]atomic.Uint64
+
+	mu        sync.Mutex
+	ruleHits  map[string]uint64 // rule id -> times that rule was the winner
+	ruleAllow map[string]uint64
+	ruleDeny  map[string]uint64
+}
+
+func New() *Counters {
+	return &Counters{
+		ruleHits:  map[string]uint64{},
+		ruleAllow: map[string]uint64{},
+		ruleDeny:  map[string]uint64{},
+	}
+}
+
+var outcomes = []Outcome{
+	OutcomeAllowed,
+	OutcomeDeniedPolicy,
+	OutcomeResolveFailed,
+	OutcomeUpstreamDial,
+	OutcomeUpstreamIOTimeout,
+	OutcomeClientError,
+}
+
+// Record counts one request in exactly one bucket and, when a policy rule
+// decided the verdict, attributes one hit to that rule.
+func (c *Counters) Record(o Outcome, winningRule string) {
+	idx := -1
+	for i, x := range outcomes {
+		if x == o {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		panic("unknown outcome: " + string(o))
+	}
+	c.total.Add(1)
+	c.buckets[idx].Add(1)
+	if winningRule != "" {
+		c.mu.Lock()
+		c.ruleHits[winningRule]++
+		if o == OutcomeAllowed {
+			c.ruleAllow[winningRule]++
+		} else if o == OutcomeDeniedPolicy {
+			c.ruleDeny[winningRule]++
+		}
+		c.mu.Unlock()
+	}
+}
+
+// RuleStat is the per-rule attribution in a snapshot.
+type RuleStat struct {
+	Rule    string `json:"rule"`
+	Hits    uint64 `json:"hits"`
+	Allowed uint64 `json:"allowed"`
+	Denied  uint64 `json:"denied"`
+}
+
+// Snapshot is a consistent point-in-time view of all counters.
+type Snapshot struct {
+	Total  uint64            `json:"total"`
+	Counts map[string]uint64 `json:"counts"`
+	Rules  []RuleStat        `json:"rules"`
+}
+
+func (c *Counters) Snapshot() Snapshot {
+	snap := Snapshot{Counts: map[string]uint64{}}
+	snap.Total = c.total.Load()
+	for _, o := range outcomes {
+		snap.Counts[string(o)] = c.buckets[outcomeIndex(o)].Load()
+	}
+	c.mu.Lock()
+	ids := make([]string, 0, len(c.ruleHits))
+	for id := range c.ruleHits {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		snap.Rules = append(snap.Rules, RuleStat{
+			Rule:    id,
+			Hits:    c.ruleHits[id],
+			Allowed: c.ruleAllow[id],
+			Denied:  c.ruleDeny[id],
+		})
+	}
+	c.mu.Unlock()
+
+	var sum uint64
+	for _, n := range snap.Counts {
+		sum += n
+	}
+	if sum != snap.Total {
+		// Should never happen; Record always increments total and one bucket.
+		panic("stats invariant violated: bucket sum != total")
+	}
+	return snap
+}
+
+func outcomeIndex(o Outcome) int {
+	for i, x := range outcomes {
+		if x == o {
+			return i
+		}
+	}
+	return -1
+}
