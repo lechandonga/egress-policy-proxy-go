@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "default_action": "deny",
+  "rules": [
+    {
+      "id": "allow-example-https",
+      "action": "allow",
+      "domains": ["example.com", "*.example.org"],
+      "ports": [443]
+    },
+    {
+      "id": "allow-httpbin-http",
+      "action": "allow",
+      "domains": ["httpbin.local"],
+      "ports": [80, "8080-8090"]
+    },
+    {
+      "id": "deny-internal-cidr",
+      "action": "deny",
+      "ips": ["10.0.0.0/8", "192.168.0.0/16", "169.254.0.0/16"]
+    },
+    {
+      "id": "allow-dns-server",
+      "action": "allow",
+      "ips": ["1.1.1.1", "8.8.8.8"],
+      "ports": [53]
+    }
+  ]
+}
