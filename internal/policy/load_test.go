@@ -77,6 +77,91 @@ func TestMalformedPoliciesRejected(t *testing.T) {
 			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["9000-8000"]}]}`,
 			"low > high",
 		},
+		{
+			"port range with extra segment",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["80-90-100"]}]}`,
+			"invalid port range",
+		},
+		{
+			"port range with trailing garbage",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["80-90x"]}]}`,
+			"invalid port range",
+		},
+		{
+			"port range with spaces",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["80 - 90"]}]}`,
+			"invalid port range",
+		},
+		{
+			"port range open ended",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["80-"]}]}`,
+			"invalid port range",
+		},
+		{
+			"port range negative",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["-5-10"]}]}`,
+			"invalid port range",
+		},
+		{
+			"port number too large",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":[70000]}]}`,
+			"port must be a number",
+		},
+		{
+			"port string range too large",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test"],"ports":["1-70000"]}]}`,
+			"invalid port range",
+		},
+		{
+			"cidr with host bits set is not auto-masked",
+			`{"rules":[{"id":"r1","action":"allow","cidrs":["10.0.0.1/24"]}]}`,
+			"host bits set",
+		},
+		{
+			"ipv4-mapped ipv6 address rejected",
+			`{"rules":[{"id":"r1","action":"allow","cidrs":["::ffff:10.0.0.1"]}]}`,
+			"canonical IPv4",
+		},
+		{
+			"ipv4-mapped ipv6 prefix rejected",
+			`{"rules":[{"id":"r1","action":"allow","cidrs":["::ffff:10.0.0.0/104"]}]}`,
+			"canonical IPv4",
+		},
+		{
+			"zoned address rejected",
+			`{"rules":[{"id":"r1","action":"allow","cidrs":["fe80::1%eth0"]}]}`,
+			"zone",
+		},
+		{
+			"domain label starts with dash",
+			`{"rules":[{"id":"r1","action":"allow","domains":["-bad.test"]}]}`,
+			"must not start or end",
+		},
+		{
+			"domain label ends with dash",
+			`{"rules":[{"id":"r1","action":"allow","domains":["bad-.test"]}]}`,
+			"must not start or end",
+		},
+		{
+			"domain empty label",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a..test"]}]}`,
+			"invalid domain label",
+		},
+		{
+			"domain underscore rejected",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a_b.test"]}]}`,
+			"invalid domain",
+		},
+		{
+			"domain with port rejected",
+			`{"rules":[{"id":"r1","action":"allow","domains":["a.test:443"]}]}`,
+			"invalid domain",
+		},
+		{
+			"wildcard with empty suffix",
+			`{"rules":[{"id":"r1","action":"allow","domains":["*."]}]}`,
+			"invalid domain",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,4 +278,54 @@ func TestConcurrentEvaluationNoRace(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// Business: every malformed variant fails the WHOLE reload and the old
+// policy keeps serving byte-for-byte; nothing is repaired or defaulted.
+func TestInvalidReloadKeepsOldPolicyUntouched(t *testing.T) {
+	bad := []string{
+		`{"rules":[{"id":"r","action":"allow","domains":["a.test"],"ports":[0]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a.test"],"ports":["80-90-100"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a.test"],"ports":["80-90x"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a.test"],"ports":["1-70000"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a.test"],"ports":[70000]}]}`,
+		`{"rules":[{"id":"r","action":"allow","cidrs":["10.0.0.1/24"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","cidrs":["::ffff:10.0.0.1"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","cidrs":["fe80::1%eth0"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","cidrs":["0.0.0.0/0"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["-bad.test"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a..test"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a_b.test"]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["*."]}]}`,
+		`{"rules":[{"id":"r","action":"allow","domains":["a.*.test"]}]}`,
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.json")
+	good := `{"rules":[{"id":"good","action":"allow","domains":["good.test"]}]}`
+	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore()
+	p0, err := store.LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, doc := range bad {
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.LoadFile(path); err == nil {
+			t.Fatalf("case %d: invalid policy must fail to load: %s", i, doc)
+		} else if !IsLoadError(err) {
+			t.Fatalf("case %d: want LoadError, got %v", i, err)
+		}
+		cur, ok := store.Current()
+		if !ok || cur != p0 || cur.Version != p0.Version {
+			t.Fatalf("case %d: old policy must stay active and identical", i)
+		}
+		d := cur.Evaluate(Match{Host: "good.test", Port: 443})
+		if !d.Allowed || d.WinningRule != "good" {
+			t.Fatalf("case %d: old policy no longer decides correctly: %+v", i, d)
+		}
+	}
 }

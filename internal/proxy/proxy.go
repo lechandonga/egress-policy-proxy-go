@@ -74,33 +74,51 @@ type verdict struct {
 	ip       netip.Addr
 }
 
-// authorize resolves host (when needed) and evaluates the policy against the
-// domain together with EVERY resolved address, so an allowed name that
+// authorize resolves host (when needed) and evaluates the policy against
+// the domain together with EVERY resolved address, so an allowed name that
 // resolves into a denied CIDR cannot bypass the policy.
 func (p *Proxy) authorize(ctx context.Context, host string, port uint16) ([]verdict, string, error) {
-	snap, ok := p.store.Current()
+	_, verdicts, reason, err := evaluate(ctx, p.store, p.cfg.Resolver, host, port, nil)
+	return verdicts, reason, err
+}
+
+// evaluate is the single decision core shared by real forwarding and the
+// admin dry-run: same snapshot handling, same resolution rules, same
+// per-address evaluation and the same "any denied address denies the whole
+// request" collapse. assumed, when non-empty, replaces live resolution.
+// The returned snapshot is the one the verdicts were computed from, so
+// callers can report exactly which policy version decided.
+func evaluate(ctx context.Context, store *policy.Store, res resolver.Resolver, host string, port uint16, assumed []netip.Addr) (*policy.Policy, []verdict, string, error) {
+	snap, ok := store.Current()
 	if !ok {
-		return nil, ReasonNoPolicy, errors.New("no policy loaded; proxy fails closed")
+		return nil, nil, ReasonNoPolicy, errors.New("no policy loaded; proxy fails closed")
 	}
 
 	var ips []netip.Addr
-	if addr, err := netip.ParseAddr(host); err == nil {
-		ips = []netip.Addr{addr.Unmap()}
-		host = ""
-	} else {
-		addrs, err := p.cfg.Resolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			var rerr *resolver.Error
-			if errors.As(err, &rerr) && rerr.Class == resolver.ClassNXDOMAIN {
-				return nil, ReasonResolveNXDOMAIN, err
-			}
-			return nil, ReasonResolveFailure, err
-		}
-		if len(addrs) == 0 {
-			return nil, ReasonResolveFailure, errors.New("resolver returned no addresses for " + host)
-		}
-		for _, a := range addrs {
+	switch {
+	case len(assumed) > 0:
+		for _, a := range assumed {
 			ips = append(ips, a.Unmap())
+		}
+	default:
+		if addr, err := netip.ParseAddr(host); err == nil {
+			ips = []netip.Addr{addr.Unmap()}
+			host = ""
+		} else {
+			addrs, err := res.LookupNetIP(ctx, "ip", host)
+			if err != nil {
+				var rerr *resolver.Error
+				if errors.As(err, &rerr) && rerr.Class == resolver.ClassNXDOMAIN {
+					return nil, nil, ReasonResolveNXDOMAIN, err
+				}
+				return nil, nil, ReasonResolveFailure, err
+			}
+			if len(addrs) == 0 {
+				return nil, nil, ReasonResolveFailure, errors.New("resolver returned no addresses for " + host)
+			}
+			for _, a := range addrs {
+				ips = append(ips, a.Unmap())
+			}
 		}
 	}
 
@@ -114,10 +132,51 @@ func (p *Proxy) authorize(ctx context.Context, host string, port uint16) ([]verd
 	// a mixed answer set must not let a denied address be reached.
 	for _, v := range verdicts {
 		if !v.decision.Allowed {
-			return []verdict{v}, "", nil
+			return snap, []verdict{v}, "", nil
 		}
 	}
-	return verdicts, "", nil
+	return snap, verdicts, "", nil
+}
+
+// DryRunResult is the outcome of a what-if policy evaluation. Nothing is
+// forwarded and nothing is counted in the traffic statistics.
+type DryRunResult struct {
+	Allowed      bool     `json:"allowed"`
+	Action       string   `json:"action"`
+	WinningRule  string   `json:"winning_rule,omitempty"`
+	Reason       string   `json:"reason"`
+	MatchedRules []string `json:"matched_rules,omitempty"`
+	IPs          []string `json:"ips"`
+	Version      string   `json:"version"`
+}
+
+// DryRun evaluates host/port (optionally against assumed resolved
+// addresses) against exactly one policy snapshot and reports the verdict,
+// the winning rule and the version that decided. It shares evaluate() with
+// real forwarding, so identical inputs always yield identical conclusions.
+func DryRun(ctx context.Context, store *policy.Store, res resolver.Resolver, host string, port uint16, assumed []netip.Addr) (DryRunResult, string, error) {
+	snap, verdicts, reason, err := evaluate(ctx, store, res, host, port, assumed)
+	if err != nil {
+		return DryRunResult{}, reason, err
+	}
+	chosen := verdicts[0]
+	res2 := DryRunResult{
+		Allowed:      chosen.decision.Allowed,
+		Action:       string(chosen.decision.Action),
+		WinningRule:  chosen.decision.WinningRule,
+		Reason:       chosen.decision.Reason,
+		MatchedRules: chosen.decision.MatchedRules,
+		Version:      snap.Version,
+	}
+	seen := map[string]bool{}
+	for _, v := range verdicts {
+		s := v.ip.String()
+		if !seen[s] {
+			seen[s] = true
+			res2.IPs = append(res2.IPs, s)
+		}
+	}
+	return res2, "", nil
 }
 
 func (p *Proxy) count(o stats.Outcome, rule string) { p.counter.Record(o, rule) }

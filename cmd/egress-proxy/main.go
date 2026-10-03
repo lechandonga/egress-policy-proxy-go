@@ -41,14 +41,11 @@ func main() {
 	}
 	log.Printf("loaded policy %s with %d rules", p.Version, len(p.Rules))
 
+	reloader := policy.NewReloader(store, *policyPath)
 	reload := func() (*policy.Policy, error) {
-		np, err := store.LoadFile(*policyPath)
+		np, err := reloader.Reload()
 		if err != nil {
-			kind := "I/O"
-			if policy.IsLoadError(err) {
-				kind = "validation"
-			}
-			log.Printf("reload failed (%s), keeping previous policy: %v", kind, err)
+			log.Printf("reload failed, keeping previous policy: %v", err)
 			return nil, err
 		}
 		log.Printf("reloaded policy %s with %d rules", np.Version, len(np.Rules))
@@ -69,10 +66,11 @@ func main() {
 	adminSrv := &http.Server{
 		Addr: *adminListen,
 		Handler: (&admin.Server{
-			Store:      store,
-			Counters:   counters,
-			PolicyPath: *policyPath,
-			Reload:     reload,
+			Store:         store,
+			Counters:      counters,
+			PolicyPath:    *policyPath,
+			Reload:        reload,
+			ReloadHistory: reloader.History,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -93,12 +91,18 @@ func main() {
 		}
 	}()
 
-	sig := <-sigCh
-	if sig == syscall.SIGHUP {
-		if _, err := reload(); err != nil {
-			log.Printf("SIGHUP reload failed: %v", err)
-		}
+	// SIGHUP triggers a reload; any number of them are handled in a loop.
+	// Reloads are serialized by the reloader, so dense bursts (deploy
+	// scripts often send several) each complete cleanly and the process
+	// never exits because of a reload.
+	var sig os.Signal
+	for sig != syscall.SIGINT && sig != syscall.SIGTERM {
 		sig = <-sigCh
+		if sig == syscall.SIGHUP {
+			if _, err := reload(); err != nil {
+				log.Printf("SIGHUP reload failed: %v", err)
+			}
+		}
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -142,12 +142,27 @@ func Build(rules []Rule, version string) (*Policy, error) {
 				if addrErr != nil {
 					return nil, loadErr("rule %q: invalid cidr/ip %q: %v", r.ID, c, err)
 				}
+				if addr.Zone() != "" {
+					return nil, loadErr("rule %q: address %q must not carry a zone", r.ID, c)
+				}
+				if addr.Is4In6() {
+					return nil, loadErr("rule %q: address %q must be written in canonical IPv4 form", r.ID, c)
+				}
 				prefix = netip.PrefixFrom(addr, addr.BitLen())
+			}
+			if prefix.Addr().Zone() != "" {
+				return nil, loadErr("rule %q: cidr %q must not carry a zone", r.ID, c)
+			}
+			if prefix.Addr().Is4In6() {
+				return nil, loadErr("rule %q: cidr %q must be written in canonical IPv4 form", r.ID, c)
 			}
 			if prefix.Addr().IsUnspecified() {
 				return nil, loadErr("rule %q: cidr %q matches every address and is rejected for safety", r.ID, c)
 			}
-			r.prefixes = append(r.prefixes, prefix.Masked())
+			if prefix != prefix.Masked() {
+				return nil, loadErr("rule %q: cidr %q has host bits set; write the canonical network address %q instead", r.ID, c, prefix.Masked())
+			}
+			r.prefixes = append(r.prefixes, prefix)
 		}
 
 		for _, pr := range r.Ports {
@@ -173,7 +188,7 @@ func compileDomain(ruleID, d string) (domainPattern, error) {
 	if name == "" {
 		return domainPattern{}, loadErr("rule %q: empty domain pattern", ruleID)
 	}
-	if strings.ContainsAny(name, " /") || strings.HasSuffix(name, ".") {
+	if strings.ContainsAny(name, " /:_") || strings.HasSuffix(name, ".") {
 		return domainPattern{}, loadErr("rule %q: invalid domain %q", ruleID, d)
 	}
 	wild := false
@@ -184,10 +199,27 @@ func compileDomain(ruleID, d string) (domainPattern, error) {
 	if strings.Contains(name, "*") {
 		return domainPattern{}, loadErr("rule %q: wildcard only allowed as leading %q, got %q", ruleID, "*.", d)
 	}
+	if len(name) > 253 {
+		return domainPattern{}, loadErr("rule %q: domain %q exceeds 253 characters", ruleID, d)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return domainPattern{}, loadErr("rule %q: invalid domain label in %q", ruleID, d)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return domainPattern{}, loadErr("rule %q: domain label in %q must not start or end with '-'", ruleID, d)
+		}
+		for _, ch := range label {
+			if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+				return domainPattern{}, loadErr("rule %q: invalid character %q in domain %q", ruleID, string(ch), d)
+			}
+		}
+	}
 	return domainPattern{suffix: name, wildcard: wild}, nil
 }
 
 // UnmarshalJSON accepts a number (8080) or an inclusive range ("8000-9000").
+// Malformed spellings are rejected outright; nothing is silently repaired.
 func (p *PortRange) UnmarshalJSON(raw []byte) error {
 	var single uint16
 	if err := json.Unmarshal(raw, &single); err == nil {
@@ -198,15 +230,39 @@ func (p *PortRange) UnmarshalJSON(raw []byte) error {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return fmt.Errorf("port must be a number or \"lo-hi\" range, got %s", string(raw))
 	}
-	var lo, hi int
-	if n, err := fmt.Sscanf(s, "%d-%d", &lo, &hi); err != nil || n != 2 {
+	lo, hi, ok := parsePortRange(s)
+	if !ok {
 		return fmt.Errorf("invalid port range %q: use a number or \"lo-hi\"", s)
-	}
-	if lo < 0 || hi < 0 || lo > 65535 || hi > 65535 {
-		return fmt.Errorf("port out of range in %q", s)
 	}
 	p.Lo, p.Hi = uint16(lo), uint16(hi)
 	return nil
+}
+
+// parsePortRange strictly parses "lo-hi": exactly two all-digit parts, no
+// signs, spaces or trailing garbage, each within 0-65535.
+func parsePortRange(s string) (lo, hi int, ok bool) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	vals := [2]int{}
+	for i, part := range parts {
+		if part == "" {
+			return 0, 0, false
+		}
+		n := 0
+		for _, ch := range part {
+			if ch < '0' || ch > '9' {
+				return 0, 0, false
+			}
+			n = n*10 + int(ch-'0')
+			if n > 65535 {
+				return 0, 0, false
+			}
+		}
+		vals[i] = n
+	}
+	return vals[0], vals[1], true
 }
 
 // MarshalJSON renders single-port ranges as numbers.
