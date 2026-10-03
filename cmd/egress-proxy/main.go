@@ -29,26 +29,20 @@ func main() {
 	store := policy.NewStore()
 	counters := stats.New()
 
+	reloader := policy.NewReloader(store, *policyPath)
+
 	// Startup fails closed: if the initial policy cannot be loaded the
 	// process exits instead of running an allow-all proxy.
-	p, err := store.LoadFile(*policyPath)
+	p, err := reloader.Reload()
 	if err != nil {
-		kind := "I/O"
-		if policy.IsLoadError(err) {
-			kind = "validation"
-		}
-		log.Fatalf("initial policy load failed (%s): %v", kind, err)
+		log.Fatalf("initial policy load failed (%s): %v", policy.ErrorKindOf(err), err)
 	}
 	log.Printf("loaded policy %s with %d rules", p.Version, len(p.Rules))
 
 	reload := func() (*policy.Policy, error) {
-		np, err := store.LoadFile(*policyPath)
+		np, err := reloader.Reload()
 		if err != nil {
-			kind := "I/O"
-			if policy.IsLoadError(err) {
-				kind = "validation"
-			}
-			log.Printf("reload failed (%s), keeping previous policy: %v", kind, err)
+			log.Printf("reload failed (%s), keeping previous policy: %v", policy.ErrorKindOf(err), err)
 			return nil, err
 		}
 		log.Printf("reloaded policy %s with %d rules", np.Version, len(np.Rules))
@@ -73,12 +67,40 @@ func main() {
 			Counters:   counters,
 			PolicyPath: *policyPath,
 			Reload:     reload,
+			History:    reloader.History,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	sigCh := make(chan os.Signal, 1)
+	// Buffer heavily so a deploy script that fires several SIGHUPs in a row
+	// cannot lose any trigger: each one becomes one reload result.
+	sigCh := make(chan os.Signal, 64)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+
+	// Separate channels let SIGHUP reloads happen in their own goroutine, so
+	// signals keep draining while a reload is in flight: every delivered
+	// SIGHUP (up to the channel buffer) becomes its own reload result, even
+	// when a deploy script fires several in one burst. INT/TERM are routed
+	// to the main loop for graceful shutdown.
+	hupCh := make(chan os.Signal, 64)
+	termCh := make(chan os.Signal, 4)
+	go func() {
+		for sig := range sigCh {
+			switch sig {
+			case syscall.SIGHUP:
+				hupCh <- sig
+			default:
+				termCh <- sig
+			}
+		}
+	}()
+	go func() {
+		for range hupCh {
+			if _, err := reload(); err != nil {
+				log.Printf("SIGHUP reload failed: %v", err)
+			}
+		}
+	}()
 
 	go func() {
 		log.Printf("proxy listening on %s", *listen)
@@ -93,13 +115,9 @@ func main() {
 		}
 	}()
 
-	sig := <-sigCh
-	if sig == syscall.SIGHUP {
-		if _, err := reload(); err != nil {
-			log.Printf("SIGHUP reload failed: %v", err)
-		}
-		sig = <-sigCh
-	}
+	// Keep serving through arbitrarily many reloads. SIGHUP never exits the
+	// process; the first INT/TERM initiates graceful shutdown.
+	<-termCh
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

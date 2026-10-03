@@ -4,6 +4,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Outcome is the single bucket a request is counted in. Every proxied
@@ -28,6 +29,8 @@ type Counters struct {
 	ruleHits  map[string]uint64 // rule id -> times that rule was the winner
 	ruleAllow map[string]uint64
 	ruleDeny  map[string]uint64
+
+	win *windowState
 }
 
 func New() *Counters {
@@ -35,7 +38,15 @@ func New() *Counters {
 		ruleHits:  map[string]uint64{},
 		ruleAllow: map[string]uint64{},
 		ruleDeny:  map[string]uint64{},
+		win:       newWindowState(),
 	}
+}
+
+// SetClock overrides the clock used for rolling windows (tests only).
+func (c *Counters) SetClock(now func() time.Time) {
+	c.win.mu.Lock()
+	c.win.now = now
+	c.win.mu.Unlock()
 }
 
 var outcomes = []Outcome{
@@ -50,18 +61,13 @@ var outcomes = []Outcome{
 // Record counts one request in exactly one bucket and, when a policy rule
 // decided the verdict, attributes one hit to that rule.
 func (c *Counters) Record(o Outcome, winningRule string) {
-	idx := -1
-	for i, x := range outcomes {
-		if x == o {
-			idx = i
-			break
-		}
-	}
+	idx := outcomeIndex(o)
 	if idx < 0 {
 		panic("unknown outcome: " + string(o))
 	}
 	c.total.Add(1)
 	c.buckets[idx].Add(1)
+	c.win.record(idx, winningRule)
 	if winningRule != "" {
 		c.mu.Lock()
 		c.ruleHits[winningRule]++
@@ -121,6 +127,24 @@ func (c *Counters) Snapshot() Snapshot {
 	}
 	return snap
 }
+
+// Window returns a coherent snapshot of requests recorded during the
+// trailing d interval. d must be > 0 and <= MaxWindow. It does not change
+// any cumulative counter.
+func (c *Counters) Window(d time.Duration) (WindowSnapshot, error) {
+	if d <= 0 {
+		return WindowSnapshot{}, ErrInvalidWindow{"window must be > 0"}
+	}
+	if d > MaxWindow {
+		return WindowSnapshot{}, ErrInvalidWindow{"window exceeds maximum " + MaxWindow.String()}
+	}
+	return c.win.snapshot(d), nil
+}
+
+// ErrInvalidWindow marks an illegal window parameter.
+type ErrInvalidWindow struct{ Msg string }
+
+func (e ErrInvalidWindow) Error() string { return e.Msg }
 
 func outcomeIndex(o Outcome) int {
 	for i, x := range outcomes {

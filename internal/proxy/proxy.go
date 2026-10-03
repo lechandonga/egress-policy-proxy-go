@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/lechandonga/egress-policy-proxy-go/internal/policy"
@@ -70,54 +69,54 @@ func New(store *policy.Store, counter *stats.Counters, cfg Config) *Proxy {
 
 // verdict bundles the evaluated decision with the IP it applies to.
 type verdict struct {
-	decision policy.Decision
-	ip       netip.Addr
+	adjudication policy.Adjudication
+	ip           netip.Addr
 }
 
 // authorize resolves host (when needed) and evaluates the policy against the
 // domain together with EVERY resolved address, so an allowed name that
 // resolves into a denied CIDR cannot bypass the policy.
-func (p *Proxy) authorize(ctx context.Context, host string, port uint16) ([]verdict, string, error) {
+//
+// Evaluation itself goes through Policy.Adjudicate — the same function the
+// dry-run endpoint uses — so trial verdicts and real forwarding verdicts
+// cannot drift apart.
+func (p *Proxy) authorize(ctx context.Context, host string, port uint16) (verdict, string, error) {
 	snap, ok := p.store.Current()
 	if !ok {
-		return nil, ReasonNoPolicy, errors.New("no policy loaded; proxy fails closed")
+		return verdict{}, ReasonNoPolicy, errors.New("no policy loaded; proxy fails closed")
 	}
 
 	var ips []netip.Addr
 	if addr, err := netip.ParseAddr(host); err == nil {
 		ips = []netip.Addr{addr.Unmap()}
-		host = ""
+		adj := snap.Adjudicate("", port, ips)
+		return verdict{adjudication: adj, ip: ips[0]}, "", nil
 	} else {
 		addrs, err := p.cfg.Resolver.LookupNetIP(ctx, "ip", host)
 		if err != nil {
 			var rerr *resolver.Error
 			if errors.As(err, &rerr) && rerr.Class == resolver.ClassNXDOMAIN {
-				return nil, ReasonResolveNXDOMAIN, err
+				return verdict{}, ReasonResolveNXDOMAIN, err
 			}
-			return nil, ReasonResolveFailure, err
+			return verdict{}, ReasonResolveFailure, err
 		}
 		if len(addrs) == 0 {
-			return nil, ReasonResolveFailure, errors.New("resolver returned no addresses for " + host)
+			return verdict{}, ReasonResolveFailure, errors.New("resolver returned no addresses for " + host)
 		}
 		for _, a := range addrs {
 			ips = append(ips, a.Unmap())
 		}
 	}
 
-	verdicts := make([]verdict, 0, len(ips))
-	for _, ip := range ips {
-		d := snap.Evaluate(policy.Match{Host: strings.ToLower(host), IP: ip, Port: port})
-		verdicts = append(verdicts, verdict{decision: d, ip: ip})
-	}
-
-	// If any resolved address is denied, the whole request is denied:
-	// a mixed answer set must not let a denied address be reached.
-	for _, v := range verdicts {
-		if !v.decision.Allowed {
-			return []verdict{v}, "", nil
+	adj := snap.Adjudicate(host, port, ips)
+	chosenIP := ips[0]
+	for _, av := range adj.Addresses {
+		if !av.Decision.Allowed {
+			chosenIP = av.IP
+			break
 		}
 	}
-	return verdicts, "", nil
+	return verdict{adjudication: adj, ip: chosenIP}, "", nil
 }
 
 func (p *Proxy) count(o stats.Outcome, rule string) { p.counter.Record(o, rule) }
@@ -205,19 +204,18 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.cfg.RequestTimeout)
 	defer cancel()
 
-	verdicts, reason, err := p.authorize(ctx, host, port)
+	chosen, reason, err := p.authorize(ctx, host, port)
 	if err != nil {
 		p.writeAuthzError(w, reason, err)
 		return
 	}
-	chosen := verdicts[0]
-	if !chosen.decision.Allowed {
-		p.count(stats.OutcomeDeniedPolicy, chosen.decision.WinningRule)
+	if !chosen.adjudication.Allowed {
+		p.count(stats.OutcomeDeniedPolicy, chosen.adjudication.WinningRule)
 		p.rejectResponse(w, reject{
 			status: http.StatusForbidden,
 			reason: ReasonPolicyDeny,
-			rule:   chosen.decision.WinningRule,
-			detail: chosen.decision.Reason,
+			rule:   chosen.adjudication.WinningRule,
+			detail: chosen.adjudication.Reason,
 		})
 		return
 	}
@@ -256,7 +254,7 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_ = copyWithIdle(w, resp.Body, p.cfg.IOIdleTimeout, conn)
-	p.count(stats.OutcomeAllowed, chosen.decision.WinningRule)
+	p.count(stats.OutcomeAllowed, chosen.adjudication.WinningRule)
 }
 
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -270,19 +268,18 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.cfg.RequestTimeout)
 	defer cancel()
 
-	verdicts, reason, err := p.authorize(ctx, host, port)
+	chosen, reason, err := p.authorize(ctx, host, port)
 	if err != nil {
 		p.writeAuthzError(w, reason, err)
 		return
 	}
-	chosen := verdicts[0]
-	if !chosen.decision.Allowed {
-		p.count(stats.OutcomeDeniedPolicy, chosen.decision.WinningRule)
+	if !chosen.adjudication.Allowed {
+		p.count(stats.OutcomeDeniedPolicy, chosen.adjudication.WinningRule)
 		p.rejectResponse(w, reject{
 			status: http.StatusForbidden,
 			reason: ReasonPolicyDeny,
-			rule:   chosen.decision.WinningRule,
-			detail: chosen.decision.Reason,
+			rule:   chosen.adjudication.WinningRule,
+			detail: chosen.adjudication.Reason,
 		})
 		return
 	}
@@ -323,7 +320,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = client.Close()
 	_ = conn.Close()
 	<-done
-	p.count(stats.OutcomeAllowed, chosen.decision.WinningRule)
+	p.count(stats.OutcomeAllowed, chosen.adjudication.WinningRule)
 }
 
 func (p *Proxy) writeAuthzError(w http.ResponseWriter, reason string, err error) {

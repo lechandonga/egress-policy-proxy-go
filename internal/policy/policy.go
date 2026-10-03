@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -58,14 +59,47 @@ type Config struct {
 	Rules []Rule `json:"rules"`
 }
 
+// ErrorKind classifies why a reload failed so callers (and the reload
+// history) can distinguish failure categories programmatically.
+type ErrorKind string
+
+const (
+	KindIO            ErrorKind = "io"             // file could not be read
+	KindInvalidJSON   ErrorKind = "invalid_json"   // document is not valid JSON
+	KindEmptyPolicy   ErrorKind = "empty_policy"   // zero rules
+	KindInvalidID     ErrorKind = "invalid_id"     // missing/duplicate rule id
+	KindInvalidAction ErrorKind = "invalid_action" // action not allow/deny
+	KindConstraint    ErrorKind = "missing_constraint"
+	KindInvalidDomain ErrorKind = "invalid_domain"
+	KindInvalidCIDR   ErrorKind = "invalid_cidr"
+	KindInvalidPort   ErrorKind = "invalid_port"
+)
+
 // LoadError is a malformed or illegal policy document (as opposed to an I/O
 // error while reading the file).
-type LoadError struct{ reason string }
+type LoadError struct {
+	kind   ErrorKind
+	reason string
+}
 
 func (e *LoadError) Error() string { return e.reason }
 
-func loadErr(format string, args ...any) error {
-	return &LoadError{reason: fmt.Sprintf(format, args...)}
+// Kind returns the machine-readable failure category.
+func (e *LoadError) Kind() ErrorKind { return e.kind }
+
+func loadErr(kind ErrorKind, format string, args ...any) error {
+	return &LoadError{kind: kind, reason: fmt.Sprintf(format, args...)}
+}
+
+// ErrorKindOf reports the failure category. Validation failures return one
+// of the Kind* constants; anything else (including I/O errors) returns
+// KindIO.
+func ErrorKindOf(err error) ErrorKind {
+	var le *LoadError
+	if errors.As(err, &le) {
+		return le.kind
+	}
+	return KindIO
 }
 
 // IsLoadError reports whether err is a policy validation error.
@@ -88,10 +122,14 @@ func Decode(data []byte) (*Policy, error) {
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, loadErr("policy is not valid JSON: %v", err)
+		var le *LoadError
+		if errors.As(err, &le) {
+			return nil, err // field-level validation (e.g. bad port) keeps its kind
+		}
+		return nil, loadErr(KindInvalidJSON, "policy is not valid JSON: %v", err)
 	}
 	if dec.More() {
-		return nil, loadErr("policy document contains trailing JSON values")
+		return nil, loadErr(KindInvalidJSON, "policy document contains trailing JSON values")
 	}
 	return Build(cfg.Rules, "")
 }
@@ -99,7 +137,7 @@ func Decode(data []byte) (*Policy, error) {
 // Build validates and compiles rules into an immutable snapshot.
 func Build(rules []Rule, version string) (*Policy, error) {
 	if len(rules) == 0 {
-		return nil, loadErr("policy must contain at least one rule; an empty policy would deny everything and is rejected to avoid accidental lockout")
+		return nil, loadErr(KindEmptyPolicy, "policy must contain at least one rule; an empty policy would deny everything and is rejected to avoid accidental lockout")
 	}
 
 	seenIDs := make(map[string]bool, len(rules))
@@ -110,21 +148,21 @@ func Build(rules []Rule, version string) (*Policy, error) {
 		idx := i + 1
 
 		if strings.TrimSpace(r.ID) == "" {
-			return nil, loadErr("rule #%d: missing id", idx)
+			return nil, loadErr(KindInvalidID, "rule #%d: missing id", idx)
 		}
 		if seenIDs[r.ID] {
-			return nil, loadErr("rule %q: duplicate rule id", r.ID)
+			return nil, loadErr(KindInvalidID, "rule %q: duplicate rule id", r.ID)
 		}
 		seenIDs[r.ID] = true
 
 		switch r.Action {
 		case ActionAllow, ActionDeny:
 		default:
-			return nil, loadErr("rule %q: action must be %q or %q, got %q", r.ID, ActionAllow, ActionDeny, r.Action)
+			return nil, loadErr(KindInvalidAction, "rule %q: action must be %q or %q, got %q", r.ID, ActionAllow, ActionDeny, r.Action)
 		}
 
 		if len(r.Domains) == 0 && len(r.CIDRs) == 0 {
-			return nil, loadErr("rule %q: at least one domain or cidr constraint is required (a rule matching all traffic is rejected for safety)", r.ID)
+			return nil, loadErr(KindConstraint, "rule %q: at least one domain or cidr constraint is required (a rule matching all traffic is rejected for safety)", r.ID)
 		}
 
 		for _, d := range r.Domains {
@@ -136,29 +174,19 @@ func Build(rules []Rule, version string) (*Policy, error) {
 		}
 
 		for _, c := range r.CIDRs {
-			prefix, err := netip.ParsePrefix(c)
-			if err != nil {
-				addr, addrErr := netip.ParseAddr(c)
-				if addrErr != nil {
-					return nil, loadErr("rule %q: invalid cidr/ip %q: %v", r.ID, c, err)
-				}
-				prefix = netip.PrefixFrom(addr, addr.BitLen())
+			prefix, perr := compilePrefix(r.ID, c)
+			if perr != nil {
+				return nil, perr
 			}
-			if prefix.Addr().IsUnspecified() {
-				return nil, loadErr("rule %q: cidr %q matches every address and is rejected for safety", r.ID, c)
-			}
-			r.prefixes = append(r.prefixes, prefix.Masked())
+			r.prefixes = append(r.prefixes, prefix)
 		}
 
 		for _, pr := range r.Ports {
 			if pr.Lo == 0 || pr.Hi == 0 {
-				return nil, loadErr("rule %q: port 0 is not allowed", r.ID)
+				return nil, loadErr(KindInvalidPort, "rule %q: port 0 is not allowed", r.ID)
 			}
 			if pr.Lo > pr.Hi {
-				return nil, loadErr("rule %q: invalid port range %d-%d (low > high)", r.ID, pr.Lo, pr.Hi)
-			}
-			if pr.Lo > 65535 || pr.Hi > 65535 {
-				return nil, loadErr("rule %q: port out of range: %d-%d", r.ID, pr.Lo, pr.Hi)
+				return nil, loadErr(KindInvalidPort, "rule %q: invalid port range %d-%d (low > high)", r.ID, pr.Lo, pr.Hi)
 			}
 		}
 
@@ -168,13 +196,62 @@ func Build(rules []Rule, version string) (*Policy, error) {
 	return p, nil
 }
 
-func compileDomain(ruleID, d string) (domainPattern, error) {
-	name := strings.ToLower(strings.TrimSpace(d))
-	if name == "" {
-		return domainPattern{}, loadErr("rule %q: empty domain pattern", ruleID)
+// compilePrefix accepts exactly one bare IP (127.0.0.1, ::1) or one
+// canonical "addr/bits" CIDR. Nothing is corrected or defaulted: a host
+// address with a mask, a non-32/128 bit length, an out-of-range prefix
+// length, a zone suffix or a catch-all prefix all fail the whole load.
+func compilePrefix(ruleID, c string) (netip.Prefix, error) {
+	if strings.TrimSpace(c) == "" {
+		return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: empty cidr/ip", ruleID)
 	}
-	if strings.ContainsAny(name, " /") || strings.HasSuffix(name, ".") {
-		return domainPattern{}, loadErr("rule %q: invalid domain %q", ruleID, d)
+	if c != strings.TrimSpace(c) || strings.ContainsAny(c, " \t") {
+		return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: invalid cidr/ip %q: whitespace not allowed", ruleID, c)
+	}
+	raw := c
+
+	if strings.Contains(raw, "/") {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: invalid cidr %q: %v", ruleID, c, err)
+		}
+		if prefix.Addr().Zone() != "" {
+			return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: cidr %q must not carry a zone", ruleID, c)
+		}
+		// ParsePrefix accepts host bits ("10.0.0.5/24"); reject instead of
+		// silently masking them.
+		if prefix.Bits() != prefix.Addr().BitLen() && prefix.Masked() != prefix {
+			return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: cidr %q has non-zero host bits; write %q", ruleID, c, prefix.Masked().String())
+		}
+		if prefix.Addr().IsUnspecified() {
+			return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: cidr %q matches every address and is rejected for safety", ruleID, c)
+		}
+		return prefix, nil
+	}
+
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: invalid cidr/ip %q: %v", ruleID, c, err)
+	}
+	if addr.Zone() != "" {
+		return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: address %q must not carry a zone", ruleID, c)
+	}
+	prefix := netip.PrefixFrom(addr, addr.BitLen())
+	if addr.IsUnspecified() {
+		return netip.Prefix{}, loadErr(KindInvalidCIDR, "rule %q: address %q matches every address and is rejected for safety", ruleID, c)
+	}
+	return prefix, nil
+}
+
+func compileDomain(ruleID, d string) (domainPattern, error) {
+	name := strings.ToLower(d)
+	if name == "" || strings.TrimSpace(name) == "" {
+		return domainPattern{}, loadErr(KindInvalidDomain, "rule %q: empty domain pattern", ruleID)
+	}
+	if strings.ContainsAny(name, " \t/") {
+		return domainPattern{}, loadErr(KindInvalidDomain, "rule %q: invalid domain %q: whitespace not allowed", ruleID, d)
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") || strings.Contains(name, "..") {
+		return domainPattern{}, loadErr(KindInvalidDomain, "rule %q: invalid domain %q: empty or leading dot label", ruleID, d)
 	}
 	wild := false
 	if strings.HasPrefix(name, "*.") {
@@ -182,9 +259,35 @@ func compileDomain(ruleID, d string) (domainPattern, error) {
 		name = strings.TrimPrefix(name, "*.")
 	}
 	if strings.Contains(name, "*") {
-		return domainPattern{}, loadErr("rule %q: wildcard only allowed as leading %q, got %q", ruleID, "*.", d)
+		return domainPattern{}, loadErr(KindInvalidDomain, "rule %q: wildcard only allowed as leading %q, got %q", ruleID, "*.", d)
+	}
+	if name == "" {
+		return domainPattern{}, loadErr(KindInvalidDomain, "rule %q: invalid domain %q: name missing after wildcard", ruleID, d)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !validLabel(label) {
+			return domainPattern{}, loadErr(KindInvalidDomain, "rule %q: invalid domain %q: illegal label %q (labels need 1-63 letters, digits or hyphens, no leading/trailing hyphen)", ruleID, d, label)
+		}
 	}
 	return domainPattern{suffix: name, wildcard: wild}, nil
+}
+
+func validLabel(label string) bool {
+	if label == "" || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		b := label[i]
+		switch {
+		case b >= 'a' && b <= 'z', b >= '0' && b <= '9', b == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // UnmarshalJSON accepts a number (8080) or an inclusive range ("8000-9000").
@@ -196,17 +299,41 @@ func (p *PortRange) UnmarshalJSON(raw []byte) error {
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return fmt.Errorf("port must be a number or \"lo-hi\" range, got %s", string(raw))
+		return loadErr(KindInvalidPort, "port must be a number or \"lo-hi\" range, got %s", string(raw))
 	}
-	var lo, hi int
-	if n, err := fmt.Sscanf(s, "%d-%d", &lo, &hi); err != nil || n != 2 {
-		return fmt.Errorf("invalid port range %q: use a number or \"lo-hi\"", s)
+	loStr, hiStr, ok := strings.Cut(s, "-")
+	if !ok {
+		return loadErr(KindInvalidPort, "invalid port range %q: use a number or \"lo-hi\"", s)
 	}
-	if lo < 0 || hi < 0 || lo > 65535 || hi > 65535 {
-		return fmt.Errorf("port out of range in %q", s)
+	lo, err := parsePortNumber(loStr)
+	if err != nil {
+		return loadErr(KindInvalidPort, "invalid port range %q: %v", s, err)
+	}
+	hi, err := parsePortNumber(hiStr)
+	if err != nil {
+		return loadErr(KindInvalidPort, "invalid port range %q: %v", s, err)
 	}
 	p.Lo, p.Hi = uint16(lo), uint16(hi)
 	return nil
+}
+
+func parsePortNumber(s string) (int, error) {
+	if s == "" {
+		return 0, errors.New("empty port value")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("port %q must contain digits only", s)
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if n < 1 || n > 65535 {
+		return 0, fmt.Errorf("port %d out of range 1-65535", n)
+	}
+	return n, nil
 }
 
 // MarshalJSON renders single-port ranges as numbers.
@@ -342,6 +469,81 @@ func displayHost(h string) string {
 		return "-"
 	}
 	return h
+}
+
+// AddressVerdict is the Decision for one evaluated address together with
+// that address.
+type AddressVerdict struct {
+	IP       netip.Addr `json:"ip"`
+	Decision Decision   `json:"decision"`
+}
+
+// Adjudication is the combined verdict for one (host, port, address-set)
+// tuple. It is the single, shared semantics used both by real forwarding
+// (after resolution) and by dry-run trial evaluation.
+type Adjudication struct {
+	Allowed     bool             `json:"allowed"`
+	Action      Action           `json:"action"`
+	WinningRule string           `json:"winning_rule"`
+	Reason      string           `json:"reason"`
+	Host        string           `json:"host"`
+	Port        uint16           `json:"port"`
+	Addresses   []AddressVerdict `json:"addresses"`
+	DefaultDeny bool             `json:"default_deny"`
+}
+
+// Adjudicate evaluates one host (lower-cased; empty for literal-IP
+// requests), one port, against every address in the given order. The
+// semantics match real forwarding exactly:
+
+//   - with no addresses, the policy is evaluated on host+port alone (a
+//     rule matching only by CIDR cannot apply, just like an unresolved
+//     name);
+//   - otherwise every address is evaluated as part of the same tuple;
+//   - the FIRST denied address decides the whole result (in address
+//     order), so "name allowed but one resolved address falls in a deny
+//     range" is an overall denial;
+//   - when every address is allowed, the first address's verdict is the
+//     overall verdict (real forwarding dials the first resolved address).
+func (p *Policy) Adjudicate(host string, port uint16, ips []netip.Addr) Adjudication {
+	lhost := strings.ToLower(host)
+	adj := Adjudication{Host: lhost, Port: port, Action: ActionDeny}
+
+	if len(ips) == 0 {
+		d := p.Evaluate(Match{Host: lhost, Port: port})
+		adj.reasonFor(d, lhost, port, nil)
+		return adj
+	}
+
+	for _, ip := range ips {
+		d := p.Evaluate(Match{Host: lhost, IP: ip.Unmap(), Port: port})
+		adj.Addresses = append(adj.Addresses, AddressVerdict{IP: ip.Unmap(), Decision: d})
+	}
+
+	for _, av := range adj.Addresses {
+		if !av.Decision.Allowed {
+			adj.reasonFor(av.Decision, lhost, port, adj.Addresses)
+			return adj
+		}
+	}
+	adj.reasonFor(adj.Addresses[0].Decision, lhost, port, adj.Addresses)
+	return adj
+}
+
+func (a *Adjudication) reasonFor(d Decision, host string, port uint16, all []AddressVerdict) {
+	a.Allowed = d.Allowed
+	a.Action = d.Action
+	a.WinningRule = d.WinningRule
+	a.DefaultDeny = len(d.MatchedRules) == 0
+	if a.DefaultDeny {
+		a.Reason = fmt.Sprintf("default deny: no rule matches host=%q port=%d across %d address(es); policy fails closed", displayHost(host), port, len(all))
+		return
+	}
+	if !a.Allowed && len(all) > 1 {
+		a.Reason = fmt.Sprintf("denied by rule %q: at least one evaluated address is rejected (first denial wins); underlying: %s", d.WinningRule, d.Reason)
+		return
+	}
+	a.Reason = d.Reason
 }
 
 func ruleMatches(r *Rule, m Match) bool {
