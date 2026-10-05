@@ -114,8 +114,11 @@ curl -x http://127.0.0.1:8080 https://api.saas.example/
 默认监听 `127.0.0.1:8081`（`-admin-listen`）：
 
 - `GET /stats`：计数快照。`total` 为请求总数；`counts` 按上述桶分类；
-  `rules` 为每条**生效规则**的命中次数及 allow/deny 拆分。每个请求恰好计数一次，
-  桶之和恒等于总数（代码内有不变量校验）。
+  `rules` 为每条**生效规则**的命中次数及 allow/deny 拆分。每个请求恰好计数一次。
+  **快照保证：不失败且自洽**——计数与快照在同一互斥域内更新，任何一次查询拿到的都是
+  单一时间点的视图，各分类之和恒等于 `total`，各规则命中之和与总数同源一致；
+  无论并发转发与并发查询多密集，查询永远不会失败、不会返回自相矛盾的数字，
+  进程也不会因为统计查询而崩溃。
 - `GET /stats?window=5m`：在累计快照之外额外返回 `window` 字段——最近一段时间
   （Go duration，如 `30s`、`5m`、`90s`）内的观测窗口快照：`window.total`、
   `window.counts`（各分类）、`window.rules`（窗口内各生效规则命中及 allow/deny 拆分）。
@@ -125,15 +128,18 @@ curl -x http://127.0.0.1:8080 https://api.saas.example/
   分桶对齐；窗口数据保存在固定大小（3600 桶）的环形缓冲里，运行多久、查询多频繁
   内存都有上界。不带 `window` 时响应字段与口径与旧版本**完全一致**。
 - `GET /evaluate?host=<主机名>&port=<端口>[&addr=<IP>&addr=<IP>...]`：**策略试算
-  （只问不做）**。不解析真实 DNS、不拨号、不转发，也**不计入**任何放行/拒绝统计。
+  （只问不做）**。不拨号、不转发，也**不计入**任何放行/拒绝统计。
   返回 `allowed`、`action`、`winning_rule`（没有规则命中时为空且 `default_deny=true`，
   明确标识默认拒绝）、`reason`、逐地址的判定明细 `addresses`，以及本次判定实际依据的
   `version`。
   - 试算与真实转发共用同一份判定函数（`Policy.Adjudicate`）：同一组主机/端口/地址，
-    试算结论与生效规则和真发一个请求完全一致。不给 `addr` 时只按域名+端口判定
-    （此时只含 CIDR 的规则不会命中，与真实流程里"尚未解析"的情形一致）；
+    试算结论与生效规则和真发一个请求完全一致。**不给 `addr` 时按真实转发的那套处理**：
+    先通过配置的解析器解析域名（生产为系统 DNS，测试可注入离线解析器），再对解析到的
+    每一个地址做判定——所以"域名命中 allow、但实际解析地址落在拒绝网段"在试算里同样是
+    拒绝，生效规则就是那条 deny 规则；解析失败（NXDOMAIN / 解析器故障）返回 `502` 及
+    可区分的 `reason`（`resolve_nxdomain` / `resolve_failure`），绝不伪装成放行/拒绝结论；
     给了一组 `addr` 时等价于"假设解析到这些地址"：**主机名本身允许、但任一假设地址
-    落入拒绝范围，整体即拒绝**，多个地址中第一个被拒的地址决定生效规则。
+    落入拒绝范围，整体即拒绝**，多个地址中第一个被拒的地址决定生效规则，此时完全不查 DNS。
   - `host` 是字面 IP 时按纯地址请求判定，且不允许再带 `addr`。
   - 版本绑定：每次试算只取一次不可变快照，即使判定途中发生重载，结论与返回的
     `version` 也整体属于同一份策略，不会新旧混合。
@@ -160,7 +166,10 @@ curl -x http://127.0.0.1:8080 https://api.saas.example/
   路径不存在此限制）。
 - 并发触发在服务端**串行化**：同一时刻只有一次加载/切换。调用方收到成功时，
   返回的版本就是当时生效的版本；最终生效版本必然对应历史里某一次完整成功的加载，
-  不存在"收到成功但实际没生效"。
+  不存在"收到成功但实际没生效"。**结果确定性**：文件读取、校验、原子切换与历史记录
+  在同一把锁内完成，因此不存在"后完成的旧内容覆盖先完成的新内容"的交错——每次成功
+  返回的版本在完成那一刻确实生效，历史里最近一次成功事件的版本必然等于当前生效版本
+  （版本溯源规则），失败则继续沿用旧版本且历史里记录当时沿用的版本。
 - 失败响应保留原字段：`error_kind` 仍是 `validation` / `io` 两分类（旧调用方不受影响），
   新增 `error_kind_detail` 给出上面列出的细分类别。
 
@@ -197,6 +206,12 @@ go test -v -count=1 -run 'Adjudicate|StrictValidation|Reloader' ./internal/polic
 go test -v -count=1 -run 'Window' ./internal/stats
 go test -v -count=1 -run 'Evaluate|Window|History|ConcurrentReload' ./internal/admin
 go test -v -count=1 -run 'DryRun|TrafficWithHighFrequency|ReloadStorm' ./internal/proxy
+
+# 本轮新增：快照自洽竞态压测 / 试算解析一致性 / 双路径重载确定性
+go test -v -count=1 -run 'SnapshotConsistent|WindowInvalid' ./internal/stats
+go test -v -count=1 -run 'EvaluateWithoutAddr|EvaluateWithAddr|ReloadDeterminism' ./internal/admin
+go test -v -count=1 -run 'AdminEvaluateWithoutAddr' ./internal/proxy
+go test -v -count=1 -run 'ChangingContent' ./internal/policy
 ```
 
 手工验证（全部本地）：
@@ -207,9 +222,10 @@ go build -o egress-proxy ./cmd/egress-proxy
 
 # 试算：允许 / 命中默认拒绝 / 假设地址落在拒绝范围
 curl -s 'http://127.0.0.1:8081/evaluate?host=api.saas.example&port=443&addr=1.2.3.4'
-curl -s 'http://127.0.0.1:8081/evaluate?host=nope.example&port=443'
 curl -s 'http://127.0.0.1:8081/evaluate?host=api.saas.example&port=443&addr=127.0.0.1'
 curl -i 'http://127.0.0.1:8081/evaluate?host=api.saas.example&port=70000'   # 400
+# 不带 addr：按真实解析结果判定（这里用系统 DNS；解析失败返回 502 + reason）
+curl -s 'http://127.0.0.1:8081/evaluate?host=api.saas.example&port=443'
 
 # 窗口统计 / 重载历史
 curl -s 'http://127.0.0.1:8081/stats?window=5m' | jq .window
@@ -239,8 +255,19 @@ pkill -HUP egress-proxy; pkill -HUP egress-proxy
 
 本轮新增测试覆盖：
 
+- **统计快照不失败且自洽**：8 路高频计数 + 4 路并发累计/窗口快照交叉压测，每份快照
+  分类之和恒等于总数、规则命中与总数同源，查询零失败（`-race` 下验证）；
+- **试算不带假设地址**：通过注入的离线解析器走与真实转发相同的"解析→逐地址判定"
+  路径——域名 allow 但解析 IP 命中 deny CIDR 时试算同样拒绝且生效规则一致；多地址任一
+  命中即拒；NXDOMAIN/解析器故障返回 502 与可区分 reason、不给结论；带 `addr` 时完全不
+  查 DNS；试算零计数污染；返回版本恒等于当前生效版本；管理端 `/evaluate` 不带 addr 与
+  真实转发逐案对比一致；
+- **双路径重载确定性**：`POST /reload` 与 SIGHUP 等价路径并发触发、期间策略文件持续
+  变化（含损坏内容），每次触发都有确定结果、历史无丢失、序号连续；串行成功时返回版本
+  与 `/version` 一致；风暴结束后当前生效版本 == 历史最近一次成功版本 == 端点上报告的
+  `current_version`；
 - **试算一致性**：试算与真实转发的放行/拒绝结论与生效规则一致；假设地址命中拒绝
-  CIDR 时整体拒绝；多个假设地址中任一命中即拒绝（与顺序无关）；无地址时只按域名判定；
+  CIDR 时整体拒绝；多个假设地址中任一命中即拒绝（与顺序无关）；不给假设地址时按真实解析结果判定（与转发一致）；
   默认拒绝显式标识；试算前后转发计数零增长；参数非法一律 400；重载并发时试算结果的
   结论与版本同属一份策略；
 - **窗口统计**：窗口内各分类之和恒等于总数、规则 allow/deny 拆分守恒、时间边界
@@ -261,7 +288,7 @@ cmd/egress-proxy/        命令行入口（启动加载、SIGHUP 重载、优雅
 internal/policy/         规则模型、编译校验、冲突判定、原子快照存储与热更新
 internal/resolver/       解析抽象（标准实现 + 离线 Map/Func，错误分类）
 internal/proxy/          HTTP 转发与 HTTPS CONNECT、双重判定、超时与错误分类
-internal/stats/          无锁计数与按规则归因（单请求单次计数）
+internal/stats/          互斥一致的计数与按规则归因（单请求单次计数，快照自洽）
 internal/admin/          /stats、/reload、/version 管理接口
 （另含 /evaluate 试算、/stats?window= 窗口、/reload-history 重载历史）
 policy.example.json      策略示例

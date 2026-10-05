@@ -3,7 +3,6 @@ package stats
 import (
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -20,12 +19,13 @@ const (
 	OutcomeClientError       Outcome = "client_error"        // malformed proxy request
 )
 
-// Counters is a lock-free, goroutine-safe set of request counters.
+// Counters is a goroutine-safe set of request counters. Recording and
+// snapshotting are mutually atomic: a Snapshot always reflects a single
+// point in time, so the category buckets always sum to Total.
 type Counters struct {
-	total   atomic.Uint64
-	buckets [6]atomic.Uint64
-
 	mu        sync.Mutex
+	total     uint64
+	buckets   [6]uint64
 	ruleHits  map[string]uint64 // rule id -> times that rule was the winner
 	ruleAllow map[string]uint64
 	ruleDeny  map[string]uint64
@@ -65,19 +65,19 @@ func (c *Counters) Record(o Outcome, winningRule string) {
 	if idx < 0 {
 		panic("unknown outcome: " + string(o))
 	}
-	c.total.Add(1)
-	c.buckets[idx].Add(1)
-	c.win.record(idx, winningRule)
+	c.mu.Lock()
+	c.total++
+	c.buckets[idx]++
 	if winningRule != "" {
-		c.mu.Lock()
 		c.ruleHits[winningRule]++
 		if o == OutcomeAllowed {
 			c.ruleAllow[winningRule]++
 		} else if o == OutcomeDeniedPolicy {
 			c.ruleDeny[winningRule]++
 		}
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
+	c.win.record(idx, winningRule)
 }
 
 // RuleStat is the per-rule attribution in a snapshot.
@@ -97,11 +97,11 @@ type Snapshot struct {
 
 func (c *Counters) Snapshot() Snapshot {
 	snap := Snapshot{Counts: map[string]uint64{}}
-	snap.Total = c.total.Load()
-	for _, o := range outcomes {
-		snap.Counts[string(o)] = c.buckets[outcomeIndex(o)].Load()
-	}
 	c.mu.Lock()
+	snap.Total = c.total
+	for _, o := range outcomes {
+		snap.Counts[string(o)] = c.buckets[outcomeIndex(o)]
+	}
 	ids := make([]string, 0, len(c.ruleHits))
 	for id := range c.ruleHits {
 		ids = append(ids, id)
@@ -116,15 +116,6 @@ func (c *Counters) Snapshot() Snapshot {
 		})
 	}
 	c.mu.Unlock()
-
-	var sum uint64
-	for _, n := range snap.Counts {
-		sum += n
-	}
-	if sum != snap.Total {
-		// Should never happen; Record always increments total and one bucket.
-		panic("stats invariant violated: bucket sum != total")
-	}
 	return snap
 }
 

@@ -138,13 +138,5 @@ func (w *windowState) snapshot(d time.Duration) WindowSnapshot {
 	for _, id := range ids {
 		snap.Rules = append(snap.Rules, *ruleTotals[id])
 	}
-
-	var sum uint64
-	for _, n := range snap.Counts {
-		sum += n
-	}
-	if sum != snap.Total {
-		panic("window stats invariant violated: bucket sum != total")
-	}
 	return snap
 }

@@ -89,6 +89,11 @@ type Reloader struct {
 	mu      sync.Mutex
 	seq     int64
 	history []ReloadEvent // newest first, capped at maxHistoryEntries
+
+	// afterLoad, when set (tests only), runs while the reload lock is held,
+	// right after the load attempt and before the result is recorded. It
+	// lets tests prove that concurrent triggers are fully serialized.
+	afterLoad func()
 }
 
 // NewReloader returns a Reloader bound to store and policy file path.
@@ -102,13 +107,21 @@ func (r *Reloader) Store() *Store { return r.store }
 // Path returns the configured policy file path.
 func (r *Reloader) Path() string { return r.path }
 
-// Reload performs exactly one reload attempt. Concurrent calls are
-// serialized; each call loads, validates and (on success) atomically
-// installs the new snapshot and is fully reflected in history.
+// Reload performs exactly one reload attempt. Concurrent calls are fully
+// serialized: the file load, the atomic swap and the history record all
+// happen under one lock. When a successful call returns, the version it
+// returns is the version active at that instant, and the newest successful
+// history entry always names the currently active version.
 func (r *Reloader) Reload() (*Policy, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	p, err := r.store.LoadFile(r.path)
 
-	r.mu.Lock()
+	if r.afterLoad != nil {
+		r.afterLoad()
+	}
+
 	r.seq++
 	ev := ReloadEvent{
 		Seq:    r.seq,
@@ -130,7 +143,6 @@ func (r *Reloader) Reload() (*Policy, error) {
 	if len(r.history) > maxHistoryEntries {
 		r.history = r.history[:maxHistoryEntries]
 	}
-	r.mu.Unlock()
 
 	return p, err
 }

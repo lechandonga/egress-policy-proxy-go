@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/lechandonga/egress-policy-proxy-go/internal/admin"
 	"github.com/lechandonga/egress-policy-proxy-go/internal/policy"
 )
 
@@ -188,4 +192,88 @@ func TestDryRunAssumedAddressesParity(t *testing.T) {
 	if snap.Total != 1 {
 		t.Fatalf("only the one real request must be counted, got %d", snap.Total)
 	}
+}
+
+// The admin /evaluate endpoint WITHOUT addr= must resolve through the same
+// (injected) resolver and reach the same verdict + winning rule as a real
+// forwarded request, for allow, domain-deny, resolved-IP-deny and
+// default-deny alike. The reported version must be the active policy
+// version, and trials must not move any counter.
+func TestAdminEvaluateWithoutAddrMatchesRealForwarding(t *testing.T) {
+	h := newHarness(t, baseRules)
+
+	adminSrv := httptest.NewServer((&admin.Server{
+		Store:    h.store,
+		Counters: h.counters,
+		Resolver: h.resolver,
+	}).Handler())
+	t.Cleanup(adminSrv.Close)
+
+	cur, _ := h.store.Current()
+
+	cases := []struct {
+		name      string
+		target    string
+		wantAllow bool
+		wantRule  string
+	}{
+		{"allowed", "http://upstream.test:" + h.portOf(h.upstream) + "/", true, "allow-upstream"},
+		{"denied by domain", "http://forbidden.test:" + h.portOf(h.upstream) + "/", false, "deny-domain"},
+		{"denied via resolved ip", "http://rebind.test:443/", false, "deny-203"},
+		{"default deny", "http://slow.test:80/", false, ""},
+	}
+
+	before := h.counters.Snapshot().Total
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := mustURL(t, tc.target)
+			port := portOfURL(t, u)
+
+			// Real request first: establishes the ground-truth verdict.
+			status, hdr, _ := proxyGet(t, h.proxyClient(), tc.target)
+			realAllowed := status == 200
+			if realAllowed != tc.wantAllow {
+				t.Fatalf("real allowed=%v want %v (status %d)", realAllowed, tc.wantAllow, status)
+			}
+			if !realAllowed && hdr.Get("X-Egress-Rule") != tc.wantRule {
+				t.Fatalf("real rule=%q want %q", hdr.Get("X-Egress-Rule"), tc.wantRule)
+			}
+
+			// Dry-run without addr= must agree.
+			resp, err := http.Get(adminSrv.URL + "/evaluate?host=" + u.Hostname() +
+				"&port=" + portString(port))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("evaluate status=%d", resp.StatusCode)
+			}
+			var m struct {
+				Allowed     bool   `json:"allowed"`
+				WinningRule string `json:"winning_rule"`
+				Version     string `json:"version"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+				t.Fatal(err)
+			}
+			if m.Allowed != realAllowed || m.WinningRule != tc.wantRule {
+				t.Fatalf("dry-run (no addr) = (%v,%q), real = (%v,%q)",
+					m.Allowed, m.WinningRule, realAllowed, tc.wantRule)
+			}
+			if m.Version != cur.Version {
+				t.Fatalf("version %q want active %q", m.Version, cur.Version)
+			}
+		})
+	}
+
+	// Only the real requests were counted; trials add nothing.
+	after := h.counters.Snapshot().Total
+	if after-before != uint64(len(cases)) {
+		t.Fatalf("evaluate polluted counters: before=%d after=%d", before, after)
+	}
+}
+
+func portString(p uint16) string {
+	return strconv.Itoa(int(p))
 }

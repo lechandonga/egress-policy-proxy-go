@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lechandonga/egress-policy-proxy-go/internal/policy"
+	"github.com/lechandonga/egress-policy-proxy-go/internal/resolver"
 	"github.com/lechandonga/egress-policy-proxy-go/internal/stats"
 )
 
@@ -26,6 +28,11 @@ type Server struct {
 	PolicyPath string
 	Reload     func() (*policy.Policy, error)
 	History    func(n int) []policy.ReloadEvent
+	// Resolver is used by /evaluate when no addr= is given, so the dry-run
+	// follows the exact same resolve-then-adjudicate path as real
+	// forwarding. Nil means resolver.Std (real DNS). Tests inject
+	// resolver.Map / resolver.Func to stay offline.
+	Resolver resolver.Resolver
 }
 
 func (s *Server) Handler() http.Handler {
@@ -86,6 +93,10 @@ type evaluationResponse struct {
 //	GET /evaluate?host=api.example.com&port=443
 //	GET /evaluate?host=api.example.com&port=443&addr=203.0.113.4&addr=10.0.0.1
 //
+// Without addr= the host is resolved through the configured resolver and
+// every resolved address is adjudicated — exactly what a real forwarded
+// request would do — so the trial verdict cannot diverge from the real
+// one. With addr= the given addresses are adjudicated instead (no DNS).
 // The snapshot is loaded once per request, so the verdict belongs to one
 // policy version end to end, even if a reload lands mid-request. Invalid
 // parameters produce a 400 rather than an allow/deny answer.
@@ -135,6 +146,37 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		}
 		evalHost = ""
 		ips = []netip.Addr{addr.Unmap()}
+	} else if len(ips) == 0 {
+		// No assumed addresses: resolve the name exactly like the real
+		// forwarding path does, then adjudicate every resolved address.
+		// A resolution failure is reported as such (never as a verdict).
+		rs := s.Resolver
+		if rs == nil {
+			rs = resolver.Std{}
+		}
+		addrs, rerr := rs.LookupNetIP(r.Context(), "ip", host)
+		if rerr != nil {
+			reason := "resolve_failure"
+			var resErr *resolver.Error
+			if errors.As(rerr, &resErr) && resErr.Class == resolver.ClassNXDOMAIN {
+				reason = "resolve_nxdomain"
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error":  rerr.Error(),
+				"reason": reason,
+			})
+			return
+		}
+		if len(addrs) == 0 {
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error":  "resolver returned no addresses for " + host,
+				"reason": "resolve_failure",
+			})
+			return
+		}
+		for _, a := range addrs {
+			ips = append(ips, a.Unmap())
+		}
 	}
 
 	adj := snap.Adjudicate(evalHost, uint16(portN), ips)

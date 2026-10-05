@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func writePolicy(t *testing.T, path, dom string) {
@@ -148,6 +151,179 @@ func TestReloaderConcurrentTriggersDeterministic(t *testing.T) {
 		if hist[i].Seq != total-int64(i) {
 			t.Fatalf("seq gap at %d: %d", i, hist[i].Seq)
 		}
+	}
+}
+
+// Concurrent triggers WHILE the policy file keeps changing: every trigger
+// gets a definite result, and at rest the active version is exactly the
+// version of the newest successful history event — a stale snapshot can
+// never be installed after a newer one completed.
+func TestReloaderConcurrentTriggersWithChangingContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.json")
+	writePolicy(t, path, "a.test")
+
+	store := NewStore()
+	rl := NewReloader(store, path)
+	if _, err := rl.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A wide policy document makes each load take measurable time, which is
+	// what exposes unsynchronized load/swap interleavings under contention.
+	writeWide := func(tag string) {
+		var b strings.Builder
+		b.WriteString(`{"rules":[`)
+		for i := 0; i < 400; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"id":"%s-%d","action":"allow","domains":["%s-%d.test"]}`, tag, i, tag, i)
+		}
+		b.WriteString(`]}`)
+		if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+			t.Errorf("write policy: %v", err)
+		}
+	}
+
+	const workers, perWorker = 16, 25
+	var wg sync.WaitGroup
+	var successes, failures atomic.Int64
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				if (seed+i)%6 == 0 {
+					_ = os.WriteFile(path, []byte(`{broken`), 0o600)
+				} else {
+					writeWide(fmt.Sprintf("w%dn%d", seed, i))
+				}
+				p, err := rl.Reload()
+				if err != nil {
+					failures.Add(1)
+					continue
+				}
+				successes.Add(1)
+				// The returned policy must be a fully compiled snapshot.
+				if p == nil || p.Version == "" || len(p.Rules) == 0 {
+					t.Errorf("success returned an unusable policy: %+v", p)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	total := int64(workers*perWorker + 1)
+	hist := rl.History(0)
+	if int64(len(hist)) != total {
+		t.Fatalf("history %d want %d: no trigger may be lost", len(hist), total)
+	}
+	if successes.Load()+failures.Load() != workers*perWorker {
+		t.Fatalf("results=%d want %d", successes.Load()+failures.Load(), workers*perWorker)
+	}
+	for i := range hist {
+		if hist[i].Seq != total-int64(i) {
+			t.Fatalf("seq gap at %d: %d", i, hist[i].Seq)
+		}
+		if hist[i].Result == ReloadSuccess && hist[i].Version != hist[i].LoadedVersion {
+			t.Fatalf("success event %d: version %q != loaded %q", hist[i].Seq, hist[i].Version, hist[i].LoadedVersion)
+		}
+	}
+
+	// The determinism contract: the newest successful event names the
+	// currently active version.
+	cur, ok := store.Current()
+	if !ok {
+		t.Fatal("no active policy after reload storm")
+	}
+	for _, ev := range hist {
+		if ev.Result == ReloadSuccess {
+			if ev.Version != cur.Version {
+				t.Fatalf("newest success %s != active %s", ev.Version, cur.Version)
+			}
+			break
+		}
+	}
+}
+
+// Deterministic serialization proof: while one trigger is mid-reload
+// (inside the afterLoad hook, lock held), a second trigger cannot complete;
+// once released, both complete in trigger order and each success's version
+// is the active version at its own completion.
+func TestReloaderTriggersAreFullySerialized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.json")
+	writePolicy(t, path, "one.test")
+
+	store := NewStore()
+	rl := NewReloader(store, path)
+	p1, err := rl.Reload()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var hookCalls atomic.Int64
+	rl.afterLoad = func() {
+		if hookCalls.Add(1) == 1 {
+			close(entered)
+			<-release // hold the reload lock: nothing else may proceed
+		}
+	}
+
+	writePolicy(t, path, "two.test")
+	type outcome struct {
+		p   *Policy
+		err error
+	}
+	first := make(chan outcome, 1)
+	go func() {
+		p, err := rl.Reload()
+		first <- outcome{p, err}
+	}()
+	<-entered // first reload is now mid-flight, holding the lock
+
+	writePolicy(t, path, "three.test")
+	second := make(chan outcome, 1)
+	go func() {
+		p, err := rl.Reload()
+		second <- outcome{p, err}
+	}()
+
+	// The second trigger must not complete while the first is mid-reload.
+	select {
+	case o := <-second:
+		t.Fatalf("second reload completed concurrently: %+v", o)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+
+	o1 := <-first
+	if o1.err != nil {
+		t.Fatal(o1.err)
+	}
+	if cur, _ := store.Current(); cur.Version != o1.p.Version {
+		t.Fatalf("first success %s not active at completion (active %s)", o1.p.Version, cur.Version)
+	}
+	o2 := <-second
+	if o2.err != nil {
+		t.Fatal(o2.err)
+	}
+	if cur, _ := store.Current(); cur.Version != o2.p.Version {
+		t.Fatalf("second success %s not active at completion (active %s)", o2.p.Version, cur.Version)
+	}
+	if o1.p.Version == p1.Version || o2.p.Version == o1.p.Version {
+		t.Fatalf("expected three distinct versions: %s %s %s", p1.Version, o1.p.Version, o2.p.Version)
+	}
+
+	// Newest successful history event names the active version.
+	hist := rl.History(0)
+	if len(hist) != 3 || hist[0].Result != ReloadSuccess || hist[0].Version != o2.p.Version {
+		t.Fatalf("history lineage broken: %+v", hist)
 	}
 }
 
