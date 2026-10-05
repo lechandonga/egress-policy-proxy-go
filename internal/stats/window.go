@@ -2,7 +2,6 @@ package stats
 
 import (
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -69,9 +68,10 @@ type WindowSnapshot struct {
 	Rules    []RuleStat        `json:"rules"`
 }
 
-// windowState guards the rolling ring.
+// windowState holds the rolling ring and its clock. It has no lock of its
+// own: every access happens while the owning Counters holds Counters.mu,
+// which also serializes recording and cumulative snapshots.
 type windowState struct {
-	mu   sync.Mutex
 	ring *ring
 	now  func() time.Time
 }
@@ -80,20 +80,11 @@ func newWindowState() *windowState {
 	return &windowState{ring: newRing(), now: time.Now}
 }
 
-func (w *windowState) record(outcomeIdx int, rule string) {
-	w.mu.Lock()
-	w.ring.add(w.now(), outcomeIdx, rule)
-	w.mu.Unlock()
-}
-
 // snapshot aggregates the half-open interval (now-d, now] bucket-aligned:
 // all one-second buckets whose timestamp satisfies nowSec*1s - d < t <= now.
-// The whole aggregation runs under one lock, so the returned numbers are a
-// single coherent point-in-time view.
+// The caller must hold Counters.mu, so recording cannot interleave and the
+// returned numbers are a single coherent point-in-time view.
 func (w *windowState) snapshot(d time.Duration) WindowSnapshot {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	nowSec := w.now().Unix()
 	startSec := nowSec - int64(d/windowResolution)
 
@@ -137,14 +128,6 @@ func (w *windowState) snapshot(d time.Duration) WindowSnapshot {
 	sort.Strings(ids)
 	for _, id := range ids {
 		snap.Rules = append(snap.Rules, *ruleTotals[id])
-	}
-
-	var sum uint64
-	for _, n := range snap.Counts {
-		sum += n
-	}
-	if sum != snap.Total {
-		panic("window stats invariant violated: bucket sum != total")
 	}
 	return snap
 }

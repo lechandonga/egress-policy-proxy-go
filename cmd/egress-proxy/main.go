@@ -14,6 +14,7 @@ import (
 	"github.com/lechandonga/egress-policy-proxy-go/internal/admin"
 	"github.com/lechandonga/egress-policy-proxy-go/internal/policy"
 	"github.com/lechandonga/egress-policy-proxy-go/internal/proxy"
+	"github.com/lechandonga/egress-policy-proxy-go/internal/resolver"
 	"github.com/lechandonga/egress-policy-proxy-go/internal/stats"
 )
 
@@ -68,6 +69,7 @@ func main() {
 			PolicyPath: *policyPath,
 			Reload:     reload,
 			History:    reloader.History,
+			Resolver:   resolver.Std{},
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

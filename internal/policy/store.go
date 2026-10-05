@@ -103,12 +103,20 @@ func (r *Reloader) Store() *Store { return r.store }
 func (r *Reloader) Path() string { return r.path }
 
 // Reload performs exactly one reload attempt. Concurrent calls are
-// serialized; each call loads, validates and (on success) atomically
-// installs the new snapshot and is fully reflected in history.
+// serialized end to end: the read, validation, atomic installation and
+// history append for one trigger all happen while the same mutex is held,
+// so a later trigger cannot install its snapshot between this trigger's
+// installation and its return. Consequently a returned success means the
+// returned version is already the active one, and the most recent
+// successful event in history always owns the active snapshot. A failure
+// leaves the previous policy in place. No trigger is dropped: every caller
+// acquires the lock in turn and appends exactly one history event.
 func (r *Reloader) Reload() (*Policy, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	p, err := r.store.LoadFile(r.path)
 
-	r.mu.Lock()
 	r.seq++
 	ev := ReloadEvent{
 		Seq:    r.seq,
@@ -130,7 +138,6 @@ func (r *Reloader) Reload() (*Policy, error) {
 	if len(r.history) > maxHistoryEntries {
 		r.history = r.history[:maxHistoryEntries]
 	}
-	r.mu.Unlock()
 
 	return p, err
 }

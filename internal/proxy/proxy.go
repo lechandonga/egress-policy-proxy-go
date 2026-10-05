@@ -86,30 +86,20 @@ func (p *Proxy) authorize(ctx context.Context, host string, port uint16) (verdic
 		return verdict{}, ReasonNoPolicy, errors.New("no policy loaded; proxy fails closed")
 	}
 
-	var ips []netip.Addr
-	if addr, err := netip.ParseAddr(host); err == nil {
-		ips = []netip.Addr{addr.Unmap()}
-		adj := snap.Adjudicate("", port, ips)
-		return verdict{adjudication: adj, ip: ips[0]}, "", nil
-	} else {
-		addrs, err := p.cfg.Resolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
+	// Same resolve+adjudicate path the dry-run endpoint uses.
+	adj, err := policy.AdjudicateRequest(ctx, snap, p.cfg.Resolver, host, port, nil)
+	if err != nil {
+		if re, ok := policy.AsResolveError(err); ok {
 			var rerr *resolver.Error
-			if errors.As(err, &rerr) && rerr.Class == resolver.ClassNXDOMAIN {
+			if errors.As(re.Err, &rerr) && rerr.Class == resolver.ClassNXDOMAIN {
 				return verdict{}, ReasonResolveNXDOMAIN, err
 			}
 			return verdict{}, ReasonResolveFailure, err
 		}
-		if len(addrs) == 0 {
-			return verdict{}, ReasonResolveFailure, errors.New("resolver returned no addresses for " + host)
-		}
-		for _, a := range addrs {
-			ips = append(ips, a.Unmap())
-		}
+		return verdict{}, ReasonResolveFailure, err
 	}
 
-	adj := snap.Adjudicate(host, port, ips)
-	chosenIP := ips[0]
+	chosenIP := adj.Addresses[0].IP
 	for _, av := range adj.Addresses {
 		if !av.Decision.Allowed {
 			chosenIP = av.IP

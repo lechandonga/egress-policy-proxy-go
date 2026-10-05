@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lechandonga/egress-policy-proxy-go/internal/policy"
+	"github.com/lechandonga/egress-policy-proxy-go/internal/resolver"
 	"github.com/lechandonga/egress-policy-proxy-go/internal/stats"
 )
 
@@ -26,6 +29,10 @@ type Server struct {
 	PolicyPath string
 	Reload     func() (*policy.Policy, error)
 	History    func(n int) []policy.ReloadEvent
+	// Resolver is used by /evaluate when no addr is supplied. When nil the
+	// standard library resolver is used; tests inject an offline resolver
+	// so dry-run evaluation needs no external network.
+	Resolver policy.NameResolver
 }
 
 func (s *Server) Handler() http.Handler {
@@ -83,12 +90,16 @@ type evaluationResponse struct {
 // handleEvaluate answers "would this be allowed?" without forwarding
 // anything and without touching any traffic counter:
 //
-//	GET /evaluate?host=api.example.com&port=443
+//	GET /evaluate?host=api.example.com&port=443            (resolved like real forwarding)
 //	GET /evaluate?host=api.example.com&port=443&addr=203.0.113.4&addr=10.0.0.1
 //
 // The snapshot is loaded once per request, so the verdict belongs to one
-// policy version end to end, even if a reload lands mid-request. Invalid
-// parameters produce a 400 rather than an allow/deny answer.
+// policy version end to end, even if a reload lands mid-request. Without
+// addr the host is resolved through the same path real forwarding uses,
+// so a name allowed by a domain rule but resolving into a deny CIDR is
+// reported denied with the same winning rule; with addr the given
+// addresses stand in for resolution. Invalid parameters produce a 400;
+// a resolution failure produces a 502 rather than an allow/deny answer.
 func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	host := strings.ToLower(strings.TrimSpace(q.Get("host")))
@@ -127,17 +138,39 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 
 	// A literal IP host is evaluated as an address-only request; extra
 	// assumed addresses are meaningless in that case.
-	evalHost := host
-	if addr, err := netip.ParseAddr(host); err == nil {
+	if _, err := netip.ParseAddr(host); err == nil {
 		if len(ips) > 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "addr is not allowed when host itself is a literal IP"})
 			return
 		}
-		evalHost = ""
-		ips = []netip.Addr{addr.Unmap()}
 	}
 
-	adj := snap.Adjudicate(evalHost, uint16(portN), ips)
+	res := s.Resolver
+	if res == nil {
+		res = resolver.Std{}
+	}
+	// Bound the resolution so a dry-run cannot hang forever; policy
+	// evaluation itself is in-memory and instant.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	adj, aerr := policy.AdjudicateRequest(ctx, snap, res, host, uint16(portN), ips)
+	if aerr != nil {
+		if re, isResolve := policy.AsResolveError(aerr); isResolve {
+			reason := "resolve_failure"
+			var rerr *resolver.Error
+			if errors.As(re.Err, &rerr) && rerr.Class == resolver.ClassNXDOMAIN {
+				reason = "resolve_nxdomain"
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error":   aerr.Error(),
+				"reason":  reason,
+				"version": snap.Version,
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": aerr.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, evaluationResponse{Adjudication: adj, Version: snap.Version})
 }
 
